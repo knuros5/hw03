@@ -348,9 +348,9 @@ int main(int argc, char **argv)
 			srand(time(NULL));
 			//rand() %2 는 0,1
 			if((rand()%2) == 1)
-				deg = ROTDEGREE
+				deg = ROTDEGREE;
 			else
-				deg = -ROTDEGREE
+				deg = -ROTDEGREE;
 			printf("####Detect Obstacle!!####\ avg distance : %lf n", avg);
 			//doRotation(deg) 함수 사용
 		}
