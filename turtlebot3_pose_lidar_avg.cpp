@@ -10,13 +10,15 @@
 #include <boost/thread/mutex.hpp>
 #include <sensor_msgs/LaserScan.h>
 #include <float.h>
+#include <stdlib.h>
+#include <time.h>
 
 using namespace cv;
 using namespace std;
 
 #define toRadian(degree)	((degree) * (M_PI / 180.))
 #define toDegree(radian)	((radian) * (180. / M_PI))
-#define THRESHOLD 1.5
+#define ROTDEGREE toRadian(80)
 
 boost::mutex mutex[2];
 nav_msgs::Odometry g_odom;
@@ -49,6 +51,81 @@ scanMsgCallback(const sensor_msgs::LaserScan& msg)
 	} mutex[1].unlock();
 }
 
+tf::Transform getCurrentTransformation(void)
+{
+	tf::Transform transformation;
+	nav_msgs::Odometry odom;
+
+	mutex[0].lock(); {
+		odom = g_odom;
+	} mutex[0].unlock();
+
+	// Save position
+	transformation.setOrigin(tf::Vector3(odom.pose.pose.position.x, odom.pose.pose.position.y, odom.pose.pose.position.z));
+
+	// Save rotation angle
+	transformation.setRotation(tf::Quaternion(odom.pose.pose.orientation.x, odom.pose.pose.orientation.y, odom.pose.pose.orientation.z, odom.pose.pose.orientation.w));
+
+	return transformation;
+}
+
+
+bool doRotation(ros::Publisher &pubTeleop, tf::Transform &initialTransformation, double dRotation, double dRotationSpeed)
+{
+	//the command will be to turn at 'rotationSpeed' rad/s
+	geometry_msgs::Twist baseCmd;
+	baseCmd.linear.x = 0.0;
+	baseCmd.linear.y = 0.0;
+
+	if(dRotation < 0.) {
+		baseCmd.angular.z = -dRotationSpeed;
+	} else {
+		baseCmd.angular.z = dRotationSpeed;
+	}
+
+	// Get odometry messages of current position while moving
+	bool bDone = false;
+	ros::Rate loopRate(1000.0);
+
+
+	while(ros::ok() && !bDone) {
+		// Get callback messages
+		ros::spinOnce();
+
+		// get current transformation
+		tf::Transform currentTransformation = getCurrentTransformation();
+
+		//see how far we've traveled
+		tf::Transform relativeTransformation = initialTransformation.inverse() * currentTransformation ;
+		tf::Quaternion rotationQuat = relativeTransformation.getRotation();
+
+
+		double dAngleTurned = atan2((2 * rotationQuat[2] * rotationQuat[3]) , (1-(2 * (rotationQuat[2] * rotationQuat[2]) ) ));
+
+		// Check termination condition
+		if( fabs(dAngleTurned) > fabs(dRotation) || (dRotation == 0)) 
+		{
+			bDone = true;
+			break;
+		} else {
+			//send the drive command
+			pubTeleop.publish(baseCmd);
+			// sleep!
+			loopRate.sleep();
+		}
+
+	}
+
+	// Initialization
+	baseCmd.linear.x = 0.3;
+	baseCmd.linear.y = 0.0;
+	baseCmd.angular.z = 0.0;
+	pubTeleop.publish(baseCmd);
+
+	return bDone;
+}
+
+
 
 	void
 convertOdom2XYZRPY(nav_msgs::Odometry &odom, Vec3d &xyz, Vec3d &rpy)
@@ -68,12 +145,14 @@ convertOdom2XYZRPY(nav_msgs::Odometry &odom, Vec3d &xyz, Vec3d &rpy)
 }
 
 
-	void
-convertScan2XYZs(sensor_msgs::LaserScan& lrfScan, vector<Vec3d> &XYZs)
+void
+convertScan2XYZs(sensor_msgs::LaserScan& lrfScan, vector<Vec3d> &XYZs, double &avg)
 {
 	int nRangeSize = (int)lrfScan.ranges.size();
 	XYZs.clear();
 	XYZs.resize(nRangeSize);
+	
+	double obstacle_cnt = 0;
 
 	for(int i=0; i < nRangeSize; i++) {
 		double dRange = lrfScan.ranges[i];
@@ -84,7 +163,18 @@ convertScan2XYZs(sensor_msgs::LaserScan& lrfScan, vector<Vec3d> &XYZs)
 			double dAngle = lrfScan.angle_min + i * lrfScan.angle_increment;
 			XYZs[i] = Vec3d(dRange*cos(dAngle), dRange*sin(dAngle), 0.);
 		}
+
+		
+		if(i <= 44 || i >= 314){
+			if(!isinf(lrfScan.ranges[i])){
+				avg += lrfScan.ranges[i];
+				obstacle_cnt++;
+			}
+		}
+		
 	}
+	if(obstacle_cnt >0)
+		avg /= obstacle_cnt;
 }
 
 
@@ -132,12 +222,6 @@ initGrid(Mat &display, int nImageSize)
 	const Vec2i imageCenterCooord = Vec2i(nImageHalfSize, nImageHalfSize);
 
 	display = Mat::zeros(nImageSize, nImageSize, CV_8UC3);
-
-	line(display, Point(imageCenterCooord[0], imageCenterCooord[1]), 
-			Point(imageCenterCooord[0]+nAxisSize, imageCenterCooord[1]), Scalar(0, 0, 255), 2);
-
-	line(display, Point(imageCenterCooord[0], imageCenterCooord[1]), 
-			Point(imageCenterCooord[0], imageCenterCooord[1]+nAxisSize), Scalar(0, 255, 0), 2);
 }
 
 
@@ -234,13 +318,6 @@ printOdometryInfo(nav_msgs::Odometry &odom)
 	//printf("rotation = %lf %lf %lf %lf\n\n\n", rotation.x, rotation.y, rotation.z, rotation.w);
 }
 
-
-void
-goStraitForward(){
-
-}
-
-
 int main(int argc, char **argv)
 {
 	ros::init(argc, argv, "turtle_position_lrf_view");
@@ -270,10 +347,11 @@ int main(int argc, char **argv)
 
 	// Move turtlebot straight forward.
 	geometry_msgs::Twist baseCmd;
-	baseCmd.linear.x = 0.5;
+	baseCmd.linear.x = 0.3;
 	baseCmd.linear.y = 0;
 	baseCmd.angular.z = 0;
 	
+	bool obstacle_flag = false;
 
 	while(ros::ok()) {
 		/* 1. Call callback methods: odomMsgCallback( ), scanMsgCallback( ) */        
@@ -301,48 +379,36 @@ int main(int argc, char **argv)
 		} mutex[1].unlock();
 
 		// 3-2. Get Cartesian X-Y scan from originl scan between 360 degree.
-		convertScan2XYZs(scan, laserScanXY);
+		double avg = 0;		
+		convertScan2XYZs(scan, laserScanXY, avg);
 
 		/* 4. Calculate average distance from obstacles */
-		double turtle_position_x = odom.pose.pose.position.x;
-		double turtle_position_y = odom.pose.pose.position.y;
-		double turtle_quarternion_z = odom.pose.pose.orientation.z;
-		double turtle_quarternion_w = odom.pose.pose.orientation.w;
-
-		double avg = 0;
-		double obstacle_cnt = 0;// num of obstacles between specified angle(+/- theta).
-		int nRangeSize = (int)laserScanXY.size();
-		for(int i = 0; i < nRangeSize; i++){
-			if (isnan(laserScanXY[i][0]) || isnan(laserScanXY[i][1])) continue;
-			double distance_x = laserScanXY[i][0] - turtle_position_x;				
-			double distance_y = laserScanXY[i][1] - turtle_position_y;
-			double turtlebot_angle = atan2((2 * turtle_quarternion_z * turtle_quarternion_w),
-					(1 - (2 * turtle_quarternion_z * turtle_quarternion_z)));
-			double obstacle_angle = atan2(distance_y, distance_x);
-
-			if(abs(turtlebot_angle - obstacle_angle) < toRadian(45)){
-				obstacle_cnt++;
-				double dist = sqrt(pow(distance_x, 2.0) + pow(distance_y, .0));
-				if(!isinf(dist)){// 한번씩 계산값이 inf가 되는 경우 제거				
-					avg += dist;
-				}
-			}	
+		printf("장애물 (평균거리) = (%.3lf)\n", avg);
+		if(avg > 0 && avg < 0.7){
+			baseCmd.linear.x = 0;
+			baseCmd.linear.y = 0;
+			baseCmd.angular.z = 0;
+			obstacle_flag = true;			
 		}
-		avg /= obstacle_cnt;
-		printf("장애물 (개수, 평균거리) = (%.0lf, %.3lf)\n", obstacle_cnt, avg);
-		
-		
-		/* 4. Move turtlebot strait forward */
-		/*if(avg < THRESHOLD){
-			// stop turtlebot.
-
-			// rotate random +/- theta.
-
-		}
-		*/		
 		pubTeleop.publish(baseCmd);
 		
-
+		double deg = 0;
+		if(obstacle_flag){
+			printf("####### 장애물 감지! #######");
+			srand(time(NULL));
+                        if((rand()%2) == 1)
+                                deg = ROTDEGREE;
+                        else
+                                deg = -ROTDEGREE;
+			tf::Transform currentTransformation = getCurrentTransformation();
+			doRotation(pubTeleop, currentTransformation, deg, 0.25);
+			obstacle_flag = false;
+			
+			baseCmd.linear.x = 0.3;
+			baseCmd.linear.y = 0;
+			baseCmd.angular.z = 0;
+			pubTeleop.publish(baseCmd);
+		}
 
 		/* 5. Draw image to OpenCV */
 		// 5-1. laserScan을 월드좌표계로 변환
